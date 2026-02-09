@@ -1,0 +1,448 @@
+# DNS Integration Demo
+# Demonstrates split-horizon DNS with K8s and Globular substrate
+#
+# This example shows:
+# 1. K8s services resolving within cluster (cluster.local)
+# 2. Substrate services resolving from K8s (globular.internal)
+# 3. External services registering with substrate DNS
+# 4. Unified DNS namespace across layers
+#
+# Deploy: kubectl apply -f dns-integration-demo.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dns-demo
+
+---
+# Backend service that needs substrate storage (MinIO)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: dns-demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: busybox
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "Backend service starting..."
+              echo "Testing DNS resolution:"
+              echo ""
+
+              # Test 1: Resolve frontend (K8s service in same namespace)
+              echo "=== Test 1: K8s Service (same namespace) ==="
+              echo "Query: frontend.dns-demo.svc.cluster.local"
+              nslookup frontend.dns-demo.svc.cluster.local || echo "Not yet available"
+              echo ""
+
+              # Test 2: Resolve K8s service in different namespace
+              echo "=== Test 2: K8s Service (different namespace) ==="
+              echo "Query: kubernetes.default.svc.cluster.local"
+              nslookup kubernetes.default.svc.cluster.local
+              echo ""
+
+              # Test 3: Resolve substrate service (MinIO)
+              echo "=== Test 3: Substrate Service (MinIO) ==="
+              echo "Query: minio.globular.internal"
+              nslookup minio.globular.internal
+              echo ""
+
+              # Test 4: Resolve substrate service (etcd)
+              echo "=== Test 4: Substrate Service (etcd) ==="
+              echo "Query: etcd.globular.internal"
+              nslookup etcd.globular.internal
+              echo ""
+
+              # Test 5: External domain
+              echo "=== Test 5: External Domain ==="
+              echo "Query: google.com"
+              nslookup google.com
+              echo ""
+
+              # Demonstrate accessing MinIO (substrate) from K8s pod
+              echo "=== Test 6: HTTP to Substrate Service ==="
+              echo "Accessing MinIO health endpoint..."
+              wget -O- --no-check-certificate https://minio.globular.internal:9000/minio/health/live || echo "MinIO not accessible"
+              echo ""
+
+              echo "DNS tests complete. Sleeping..."
+              sleep 3600
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+---
+# Frontend service (K8s-internal, cluster.local)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: dns-demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: html
+              mountPath: /usr/share/nginx/html
+      volumes:
+        - name: html
+          configMap:
+            name: frontend-html
+
+---
+# Frontend ConfigMap with DNS demo page
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-html
+  namespace: dns-demo
+data:
+  index.html: |
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>DNS Integration Demo</title>
+        <style>
+            body { font-family: monospace; margin: 40px; background: #f0f0f0; }
+            .layer { background: white; padding: 20px; margin: 20px 0; border-radius: 8px; }
+            .k8s { border-left: 5px solid #326CE5; }
+            .substrate { border-left: 5px solid #FF6B35; }
+            code { background: #eee; padding: 2px 6px; border-radius: 3px; }
+            h1 { color: #333; }
+            h2 { color: #666; }
+        </style>
+    </head>
+    <body>
+        <h1>DNS Integration Demo</h1>
+        <p>This demo shows split-horizon DNS between Kubernetes and Globular substrate.</p>
+
+        <div class="layer k8s">
+            <h2>Kubernetes Layer (cluster.local)</h2>
+            <p><strong>Zone:</strong> <code>*.cluster.local</code></p>
+            <p><strong>Resolver:</strong> CoreDNS (10.96.0.10)</p>
+            <p><strong>Example:</strong> <code>frontend.dns-demo.svc.cluster.local</code></p>
+            <p><strong>Purpose:</strong> Service discovery within Kubernetes</p>
+        </div>
+
+        <div class="layer substrate">
+            <h2>Substrate Layer (globular.internal)</h2>
+            <p><strong>Zone:</strong> <code>*.globular.internal</code></p>
+            <p><strong>Resolver:</strong> Globular DNS (127.0.0.1:53)</p>
+            <p><strong>Example:</strong> <code>minio.globular.internal</code></p>
+            <p><strong>Purpose:</strong> Infrastructure service discovery</p>
+        </div>
+
+        <h2>How It Works</h2>
+        <ol>
+            <li>Pod queries DNS → Goes to CoreDNS (10.96.0.10)</li>
+            <li>If query ends with <code>.cluster.local</code> → CoreDNS resolves it (K8s services)</li>
+            <li>If query ends with <code>.globular.internal</code> → CoreDNS forwards to Globular DNS</li>
+            <li>Otherwise → CoreDNS forwards to upstream DNS (1.1.1.1)</li>
+        </ol>
+
+        <h2>Check Backend Logs</h2>
+        <pre>kubectl logs -n dns-demo -l app=backend</pre>
+        <p>Backend pods test all DNS resolution types on startup.</p>
+    </body>
+    </html>
+
+---
+# Frontend Service (K8s-internal)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: dns-demo
+spec:
+  selector:
+    app: frontend
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 80
+
+---
+# Frontend Service (External, registered with substrate DNS)
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-external
+  namespace: dns-demo
+  annotations:
+    # This tells ExternalDNS to register with Globular DNS
+    external-dns.alpha.kubernetes.io/hostname: frontend.apps.globular.internal
+    external-dns.alpha.kubernetes.io/ttl: "300"
+spec:
+  selector:
+    app: frontend
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+
+---
+# Database that uses substrate storage
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: database
+  namespace: dns-demo
+spec:
+  serviceName: database
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database
+  template:
+    metadata:
+      labels:
+        app: database
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - name: POSTGRES_PASSWORD
+              value: demo-password
+            - name: POSTGRES_DB
+              value: demoapp
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Startup command that demonstrates DNS resolution
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    sleep 5
+                    echo "Database DNS check:"
+                    nslookup minio.globular.internal || echo "Substrate DNS not resolved"
+                    echo "Database can use substrate storage via DNS!"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: minio-standard  # Uses substrate storage
+        resources:
+          requests:
+            storage: 1Gi
+
+---
+# Database Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: database
+  namespace: dns-demo
+spec:
+  selector:
+    app: database
+  clusterIP: None  # Headless service
+  ports:
+    - port: 5432
+
+---
+# Job that tests all DNS scenarios
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: dns-test
+  namespace: dns-demo
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: test
+          image: busybox
+          command:
+            - /bin/sh
+            - -c
+            - |
+              echo "=========================================="
+              echo "DNS Integration Test Suite"
+              echo "=========================================="
+              echo ""
+
+              SUCCESS=0
+              FAILURES=0
+
+              # Test function
+              test_dns() {
+                local name=$1
+                local query=$2
+                local expected_pattern=$3
+
+                echo "TEST: $name"
+                echo "Query: $query"
+
+                result=$(nslookup $query 2>&1)
+
+                if echo "$result" | grep -q "$expected_pattern"; then
+                  echo "✓ PASS"
+                  SUCCESS=$((SUCCESS + 1))
+                else
+                  echo "✗ FAIL"
+                  echo "Expected pattern: $expected_pattern"
+                  echo "Got: $result"
+                  FAILURES=$((FAILURES + 1))
+                fi
+                echo ""
+              }
+
+              # Test 1: K8s service (same namespace)
+              test_dns \
+                "K8s Service (same namespace)" \
+                "frontend.dns-demo.svc.cluster.local" \
+                "Address:"
+
+              # Test 2: K8s service (different namespace)
+              test_dns \
+                "K8s Service (kube-system)" \
+                "kube-dns.kube-system.svc.cluster.local" \
+                "10.96.0.10"
+
+              # Test 3: K8s service (short name, relies on search domain)
+              test_dns \
+                "K8s Service (short name)" \
+                "frontend" \
+                "Address:"
+
+              # Test 4: Substrate service (MinIO)
+              test_dns \
+                "Substrate Service (MinIO)" \
+                "minio.globular.internal" \
+                "127.0.0.1"
+
+              # Test 5: Substrate service (etcd)
+              test_dns \
+                "Substrate Service (etcd)" \
+                "etcd.globular.internal" \
+                "127.0.0.1"
+
+              # Test 6: Substrate service (gateway)
+              test_dns \
+                "Substrate Service (gateway)" \
+                "gateway.globular.internal" \
+                "127.0.0.1"
+
+              # Test 7: External domain
+              test_dns \
+                "External Domain" \
+                "google.com" \
+                "Address:"
+
+              # Test 8: Kubernetes API
+              test_dns \
+                "Kubernetes API" \
+                "kubernetes.default.svc.cluster.local" \
+                "10.96.0.1"
+
+              echo "=========================================="
+              echo "Results: $SUCCESS passed, $FAILURES failed"
+              echo "=========================================="
+
+              if [ $FAILURES -gt 0 ]; then
+                exit 1
+              fi
+
+---
+# What This Demo Shows:
+#
+# 1. Split-Horizon DNS:
+#    - K8s services use cluster.local (CoreDNS)
+#    - Substrate services use globular.internal (Globular DNS)
+#    - No conflicts, clean separation
+#
+# 2. Cross-Layer Access:
+#    - K8s pods can resolve substrate services
+#    - Example: Database pod → minio.globular.internal
+#    - Workload layer consuming infrastructure layer
+#
+# 3. External Registration:
+#    - frontend-external service has annotation
+#    - ExternalDNS registers with Globular DNS
+#    - Accessible as: frontend.apps.globular.internal
+#
+# 4. Unified Namespace:
+#    - frontend.dns-demo.svc.cluster.local (K8s internal)
+#    - frontend.apps.globular.internal (External, via substrate)
+#    - minio.globular.internal (Substrate service)
+#    - All resolvable from K8s pods
+#
+# How to Use This Demo:
+#
+# 1. Deploy:
+#    kubectl apply -f dns-integration-demo.yaml
+#
+# 2. Check backend DNS tests:
+#    kubectl logs -n dns-demo -l app=backend
+#
+# 3. Run comprehensive test:
+#    kubectl logs -n dns-demo job/dns-test
+#
+# 4. Access frontend:
+#    kubectl port-forward -n dns-demo svc/frontend 8080:80
+#    open http://localhost:8080
+#
+# 5. Verify substrate integration:
+#    # From any backend pod:
+#    kubectl exec -n dns-demo -it deployment/backend -- sh
+#    nslookup minio.globular.internal
+#    wget --no-check-certificate https://minio.globular.internal:9000/minio/health/live
+#
+# 6. Check ExternalDNS registration:
+#    # On host with Globular DNS:
+#    curl -sk https://127.0.0.1:10006/api/dns/records | grep frontend
+#
+# What You'll See:
+#
+# - K8s services resolve within cluster (fast, cached)
+# - Substrate services resolve via Globular DNS (forwarded)
+# - No bootstrap problem (DNS existed before K8s)
+# - Clean separation: workload DNS vs infrastructure DNS
+# - Unified namespace across both layers
+#
+# This demonstrates the substrate pattern: infrastructure truth
+# (Globular DNS) separate from workload truth (K8s CoreDNS), with
+# clean integration between them.

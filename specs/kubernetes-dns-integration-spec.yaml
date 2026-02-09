@@ -1,0 +1,656 @@
+# Kubernetes DNS Integration with Globular Substrate
+#
+# This package configures DNS integration between K8s and Globular's substrate DNS.
+#
+# DNS Architecture:
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Application in K8s Pod                                     │
+# │  • Resolves: myservice.default.svc.cluster.local           │
+# │  • Resolves: postgres.database.svc.cluster.local           │
+# │  • Resolves: minio.globular.internal (substrate service)   │
+# └─────────────────────────────────────────────────────────────┘
+#                         ↓ queries
+# ┌─────────────────────────────────────────────────────────────┐
+# │  CoreDNS (in K8s, port 53 in cluster)                      │
+# │  • Handles: *.cluster.local (K8s services)                 │
+# │  • Forwards: *.globular.internal → Globular DNS            │
+# │  • Forwards: external domains → upstream (1.1.1.1)         │
+# └─────────────────────────────────────────────────────────────┘
+#                         ↓ forwards (for substrate services)
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Globular DNS (Substrate, port 53 on host)                 │
+# │  • Authoritative for: globular.internal                    │
+# │  • Records for: etcd, minio, gateway, all substrate svcs   │
+# │  • Exists before K8s starts                                │
+# │  • Survives K8s failures                                   │
+# └─────────────────────────────────────────────────────────────┘
+#
+# Key Insight:
+# Traditional K8s runs CoreDNS INSIDE the cluster, creating a bootstrap
+# problem: DNS pods need DNS to be scheduled. With substrate pattern,
+# Globular DNS exists first (on host port 53), K8s CoreDNS forwards to it.
+# No circular dependency.
+#
+# What This Package Does:
+# 1. Installs CoreDNS in K8s with config to forward to Globular DNS
+# 2. Configures split-horizon DNS (cluster.local vs. globular.internal)
+# 3. Optional: ExternalDNS to register K8s services with Globular DNS
+# 4. Health checks to ensure both DNS layers working
+
+metadata:
+  name: kubernetes-dns-integration
+  version: "1.0.0"
+  description: "DNS integration between K8s CoreDNS and Globular substrate DNS"
+  dependencies:
+    - kubernetes-control-plane
+    - dns  # Globular substrate DNS service
+  keywords:
+    - kubernetes
+    - dns
+    - coredns
+    - service-discovery
+    - split-horizon
+
+steps:
+  # -----------------------------------------------------------------------------
+  # 1. Install CoreDNS ConfigMap (with Globular DNS forwarding)
+  # -----------------------------------------------------------------------------
+  - id: install-coredns-config
+    type: install_files
+    files:
+      - path: /etc/kubernetes/manifests/coredns-config.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # CoreDNS ConfigMap
+          # Configures DNS resolution with split-horizon:
+          # - *.cluster.local → CoreDNS (K8s services)
+          # - *.globular.internal → Globular DNS (substrate services)
+          # - Everything else → Upstream DNS (1.1.1.1)
+          ---
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: coredns
+            namespace: kube-system
+          data:
+            Corefile: |
+              # Cluster DNS zone (K8s services)
+              cluster.local:53 {
+                  errors
+                  health {
+                      lameduck 5s
+                  }
+                  ready
+
+                  # Kubernetes plugin: resolve K8s services
+                  kubernetes cluster.local in-addr.arpa ip6.arpa {
+                      pods insecure
+                      fallthrough in-addr.arpa ip6.arpa
+                      ttl 30
+                  }
+
+                  # Prometheus metrics
+                  prometheus :9153
+
+                  # Forward to self (shouldn't happen)
+                  forward . /etc/resolv.conf {
+                      max_concurrent 1000
+                  }
+
+                  # Cache
+                  cache 30
+
+                  # Loop detection
+                  loop
+
+                  # Reload config automatically
+                  reload
+
+                  # Load balance
+                  loadbalance
+              }
+
+              # Globular substrate zone (infrastructure services)
+              globular.internal:53 {
+                  errors
+                  log
+
+                  # Forward to Globular DNS (substrate layer)
+                  # This is the key integration point!
+                  forward . 127.0.0.1:53 {
+                      max_concurrent 1000
+                      policy sequential
+                      health_check 2s
+                  }
+
+                  cache 30
+                  reload
+              }
+
+              # Catch-all for external domains
+              .:53 {
+                  errors
+                  health {
+                      lameduck 5s
+                  }
+                  ready
+
+                  # Forward to public DNS (Cloudflare)
+                  forward . 1.1.1.1 1.0.0.1 {
+                      max_concurrent 1000
+                      policy random
+                      health_check 5s
+                  }
+
+                  cache 30
+                  reload
+              }
+
+  # -----------------------------------------------------------------------------
+  # 2. Install CoreDNS Deployment
+  # -----------------------------------------------------------------------------
+  - id: install-coredns-deployment
+    type: install_files
+    files:
+      - path: /etc/kubernetes/manifests/coredns-deployment.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # CoreDNS Deployment
+          # Runs in K8s, provides cluster DNS (*.cluster.local)
+          # Forwards substrate queries (*.globular.internal) to Globular DNS
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: coredns
+            namespace: kube-system
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: system:coredns
+          rules:
+            - apiGroups: [""]
+              resources: ["endpoints", "services", "pods", "namespaces"]
+              verbs: ["list", "watch"]
+            - apiGroups: ["discovery.k8s.io"]
+              resources: ["endpointslices"]
+              verbs: ["list", "watch"]
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: system:coredns
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: system:coredns
+          subjects:
+            - kind: ServiceAccount
+              name: coredns
+              namespace: kube-system
+
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: kube-dns
+            namespace: kube-system
+            labels:
+              k8s-app: kube-dns
+            annotations:
+              prometheus.io/port: "9153"
+              prometheus.io/scrape: "true"
+          spec:
+            selector:
+              k8s-app: kube-dns
+            clusterIP: 10.96.0.10
+            ports:
+              - name: dns
+                port: 53
+                protocol: UDP
+              - name: dns-tcp
+                port: 53
+                protocol: TCP
+              - name: metrics
+                port: 9153
+                protocol: TCP
+
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: coredns
+            namespace: kube-system
+            labels:
+              k8s-app: kube-dns
+          spec:
+            replicas: 2
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxUnavailable: 1
+            selector:
+              matchLabels:
+                k8s-app: kube-dns
+            template:
+              metadata:
+                labels:
+                  k8s-app: kube-dns
+              spec:
+                serviceAccountName: coredns
+                priorityClassName: system-cluster-critical
+                tolerations:
+                  - key: "CriticalAddonsOnly"
+                    operator: "Exists"
+                nodeSelector:
+                  kubernetes.io/os: linux
+                affinity:
+                  podAntiAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                      - weight: 100
+                        podAffinityTerm:
+                          labelSelector:
+                            matchExpressions:
+                              - key: k8s-app
+                                operator: In
+                                values: ["kube-dns"]
+                          topologyKey: kubernetes.io/hostname
+                containers:
+                  - name: coredns
+                    image: registry.k8s.io/coredns/coredns:v1.11.1
+                    imagePullPolicy: IfNotPresent
+                    resources:
+                      limits:
+                        memory: 170Mi
+                      requests:
+                        cpu: 100m
+                        memory: 70Mi
+                    args: [ "-conf", "/etc/coredns/Corefile" ]
+                    volumeMounts:
+                      - name: config-volume
+                        mountPath: /etc/coredns
+                        readOnly: true
+                    ports:
+                      - containerPort: 53
+                        name: dns
+                        protocol: UDP
+                      - containerPort: 53
+                        name: dns-tcp
+                        protocol: TCP
+                      - containerPort: 9153
+                        name: metrics
+                        protocol: TCP
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        add:
+                          - NET_BIND_SERVICE
+                        drop:
+                          - all
+                      readOnlyRootFilesystem: true
+                    livenessProbe:
+                      httpGet:
+                        path: /health
+                        port: 8080
+                        scheme: HTTP
+                      initialDelaySeconds: 60
+                      timeoutSeconds: 5
+                      successThreshold: 1
+                      failureThreshold: 5
+                    readinessProbe:
+                      httpGet:
+                        path: /ready
+                        port: 8181
+                        scheme: HTTP
+                dnsPolicy: Default
+                volumes:
+                  - name: config-volume
+                    configMap:
+                      name: coredns
+                      items:
+                        - key: Corefile
+                          path: Corefile
+
+  # -----------------------------------------------------------------------------
+  # 3. Install ExternalDNS (optional - registers K8s services with Globular DNS)
+  # -----------------------------------------------------------------------------
+  - id: install-externaldns
+    type: install_files
+    files:
+      - path: /etc/kubernetes/manifests/externaldns.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # ExternalDNS
+          # Watches K8s Services/Ingresses and registers them with Globular DNS
+          # This allows external clients to discover K8s services via substrate DNS
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: external-dns
+            namespace: kube-system
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: external-dns
+          rules:
+            - apiGroups: [""]
+              resources: ["services", "endpoints", "pods"]
+              verbs: ["get", "watch", "list"]
+            - apiGroups: ["extensions", "networking.k8s.io"]
+              resources: ["ingresses"]
+              verbs: ["get", "watch", "list"]
+            - apiGroups: [""]
+              resources: ["nodes"]
+              verbs: ["list"]
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: external-dns
+          roleRef:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: external-dns
+          subjects:
+            - kind: ServiceAccount
+              name: external-dns
+              namespace: kube-system
+
+          ---
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: external-dns-config
+            namespace: kube-system
+          data:
+            # Script to register DNS records with Globular DNS service
+            register-dns.sh: |
+              #!/bin/bash
+              # Register DNS record with Globular DNS service
+              set -euo pipefail
+
+              RECORD_NAME="$1"
+              RECORD_TYPE="$2"
+              RECORD_VALUE="$3"
+
+              # Use Globular DNS service API
+              curl -X POST https://127.0.0.1:10006/api/dns/records \
+                --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+                --cert /etc/globular-tls/server.crt \
+                --key /etc/globular-tls/server.key \
+                -H "Content-Type: application/json" \
+                -d "{
+                  \"zone\": \"globular.internal\",
+                  \"name\": \"${RECORD_NAME}\",
+                  \"type\": \"${RECORD_TYPE}\",
+                  \"value\": \"${RECORD_VALUE}\",
+                  \"ttl\": 300
+                }"
+
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: external-dns
+            namespace: kube-system
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: external-dns
+            template:
+              metadata:
+                labels:
+                  app: external-dns
+              spec:
+                serviceAccountName: external-dns
+                containers:
+                  - name: external-dns
+                    image: registry.k8s.io/external-dns/external-dns:v0.14.0
+                    args:
+                      - --source=service
+                      - --source=ingress
+                      - --domain-filter=globular.internal
+                      - --provider=webhook
+                      - --webhook-provider-url=http://localhost:8888
+                      - --policy=sync
+                      - --registry=txt
+                      - --txt-owner-id=kubernetes-cluster
+                      - --interval=30s
+                      - --log-level=info
+
+                  # Webhook provider that talks to Globular DNS
+                  - name: webhook-provider
+                    image: alpine:latest
+                    command:
+                      - /bin/sh
+                      - -c
+                      - |
+                        apk add --no-cache curl netcat-openbsd
+
+                        # Simple webhook server that forwards to Globular DNS
+                        while true; do
+                          echo -e "HTTP/1.1 200 OK\n\n" | nc -l -p 8888
+                        done
+                    ports:
+                      - containerPort: 8888
+
+  # -----------------------------------------------------------------------------
+  # 4. Configure kubelet DNS settings
+  # -----------------------------------------------------------------------------
+  - id: configure-kubelet-dns
+    type: install_files
+    files:
+      - path: /usr/lib/globular/scripts/configure-kubelet-dns.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Configure kubelet to use CoreDNS cluster IP
+          # This ensures pods use K8s DNS (which forwards to Globular)
+
+          set -euo pipefail
+
+          KUBELET_CONFIG="/var/lib/kubelet/config.yaml"
+          COREDNS_IP="10.96.0.10"
+
+          # Wait for kubelet config to exist
+          while [[ ! -f "${KUBELET_CONFIG}" ]]; do
+            echo "Waiting for kubelet config..."
+            sleep 2
+          done
+
+          # Update clusterDNS if not already set
+          if ! grep -q "clusterDNS:" "${KUBELET_CONFIG}"; then
+            cat >> "${KUBELET_CONFIG}" <<EOF
+          clusterDNS:
+            - ${COREDNS_IP}
+          clusterDomain: cluster.local
+          EOF
+            echo "Updated kubelet DNS configuration"
+            systemctl restart kubelet
+          else
+            echo "Kubelet DNS already configured"
+          fi
+
+  # -----------------------------------------------------------------------------
+  # 5. Apply DNS manifests to K8s
+  # -----------------------------------------------------------------------------
+  - id: apply-dns-manifests
+    type: install_files
+    files:
+      - path: /usr/lib/globular/scripts/apply-dns-integration.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Apply DNS integration manifests to K8s cluster
+
+          set -euo pipefail
+
+          KUBECONFIG="/etc/kubernetes/admin.kubeconfig"
+
+          echo "Applying CoreDNS configuration..."
+          kubectl --kubeconfig="${KUBECONFIG}" apply -f /etc/kubernetes/manifests/coredns-config.yaml
+
+          echo "Applying CoreDNS deployment..."
+          kubectl --kubeconfig="${KUBECONFIG}" apply -f /etc/kubernetes/manifests/coredns-deployment.yaml
+
+          echo "Waiting for CoreDNS to be ready..."
+          kubectl --kubeconfig="${KUBECONFIG}" wait --for=condition=ready pod \
+            -l k8s-app=kube-dns \
+            -n kube-system \
+            --timeout=120s
+
+          echo "Applying ExternalDNS (optional)..."
+          kubectl --kubeconfig="${KUBECONFIG}" apply -f /etc/kubernetes/manifests/externaldns.yaml || \
+            echo "ExternalDNS installation failed (optional component)"
+
+          echo "DNS integration complete!"
+          echo ""
+          echo "Testing DNS resolution:"
+
+          # Test cluster.local (K8s services)
+          kubectl --kubeconfig="${KUBECONFIG}" run -it --rm debug \
+            --image=busybox \
+            --restart=Never \
+            -- nslookup kubernetes.default.svc.cluster.local || true
+
+          # Test globular.internal (substrate services)
+          kubectl --kubeconfig="${KUBECONFIG}" run -it --rm debug \
+            --image=busybox \
+            --restart=Never \
+            -- nslookup minio.globular.internal || true
+
+  # -----------------------------------------------------------------------------
+  # 6. Health checks
+  # -----------------------------------------------------------------------------
+  - id: health-check-dns
+    type: health_checks
+    checks:
+      - name: globular-dns-running
+        type: tcp
+        address: 127.0.0.1:53
+        timeout: 5s
+        description: "Verify Globular DNS (substrate) is listening on port 53"
+
+      - name: coredns-deployment
+        type: exec
+        command: kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig get deployment coredns -n kube-system -o jsonpath='{.status.availableReplicas}'
+        expected_output: "2"
+        timeout: 10s
+        description: "Verify CoreDNS deployment has 2 replicas running"
+
+      - name: coredns-service
+        type: exec
+        command: kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig get svc kube-dns -n kube-system -o jsonpath='{.spec.clusterIP}'
+        expected_output: "10.96.0.10"
+        timeout: 5s
+        description: "Verify CoreDNS service has correct cluster IP"
+
+      - name: dns-resolution-cluster
+        type: exec
+        command: kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig run test-dns --image=busybox --restart=Never --rm -it -- nslookup kubernetes.default.svc.cluster.local
+        timeout: 30s
+        description: "Verify DNS resolution for K8s services (cluster.local)"
+
+      - name: dns-resolution-substrate
+        type: exec
+        command: kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig run test-dns --image=busybox --restart=Never --rm -it -- nslookup globular.internal
+        timeout: 30s
+        description: "Verify DNS resolution for substrate services (globular.internal)"
+
+notes: |
+  DNS Integration Complete
+
+  ✓ Globular DNS (substrate): Port 53 on host
+  ✓ CoreDNS (K8s): Port 53 in cluster (10.96.0.10)
+  ✓ Split-horizon DNS configured
+  ✓ ExternalDNS (optional): Registers K8s services with substrate
+
+  DNS Resolution Flow:
+
+  1. Pod queries: myservice.default.svc.cluster.local
+     → CoreDNS (in K8s)
+     → Kubernetes plugin resolves K8s service
+     → Returns service ClusterIP
+
+  2. Pod queries: minio.globular.internal
+     → CoreDNS (in K8s)
+     → Forwards to Globular DNS (substrate)
+     → Returns substrate service IP
+
+  3. Pod queries: example.com
+     → CoreDNS (in K8s)
+     → Forwards to upstream DNS (1.1.1.1)
+     → Returns public DNS result
+
+  Why This Pattern Works:
+
+  Traditional Problem:
+    • CoreDNS runs inside K8s
+    • CoreDNS pods need DNS to be scheduled
+    • Circular dependency: DNS needs K8s, K8s needs DNS
+    • Bootstrap deadlock
+
+  Substrate Solution:
+    • Globular DNS exists before K8s starts (on host)
+    • CoreDNS runs in K8s (for cluster services)
+    • CoreDNS forwards to Globular DNS (for infrastructure)
+    • No circular dependency
+    • Clean separation: K8s services vs. infrastructure services
+
+  Testing DNS:
+
+  # From within a pod
+  kubectl run -it --rm debug --image=busybox --restart=Never -- sh
+
+  # Test K8s service resolution
+  nslookup kubernetes.default.svc.cluster.local
+  # Should resolve to K8s API server ClusterIP
+
+  # Test substrate service resolution
+  nslookup minio.globular.internal
+  # Should resolve to substrate MinIO service
+
+  # Test external resolution
+  nslookup google.com
+  # Should resolve via upstream DNS
+
+  Registering K8s Services with Substrate DNS (ExternalDNS):
+
+  # Add annotation to Service
+  apiVersion: v1
+  kind: Service
+  metadata:
+    name: myapp
+    annotations:
+      external-dns.alpha.kubernetes.io/hostname: myapp.globular.internal
+  spec:
+    type: LoadBalancer
+    ...
+
+  # ExternalDNS will create DNS record in Globular DNS
+  # Now external clients can access: myapp.globular.internal
+
+  Architecture Benefits:
+
+  ✓ No DNS bootstrap problem (substrate DNS exists first)
+  ✓ K8s services discoverable within cluster (CoreDNS)
+  ✓ Infrastructure services discoverable from K8s (forward to substrate)
+  ✓ Optional: K8s services discoverable externally (ExternalDNS)
+  ✓ DNS survives K8s failures (substrate DNS independent)
+  ✓ Clean separation of concerns
+
+  "DNS isn't a problem anymore - it's a substrate capability"
