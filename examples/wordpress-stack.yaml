@@ -1,0 +1,335 @@
+# Complete WordPress Stack on Kubernetes (Globular Substrate)
+# Demonstrates workload layer consuming infrastructure layer
+#
+# Architecture:
+# WordPress (K8s pods) → PVCs → StorageClasses → CSI Driver → MinIO (substrate)
+# MySQL (K8s pods) → PVC → minio-replicated → substrate storage
+#
+# Deploy: kubectl apply -f wordpress-stack.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wordpress
+
+---
+# MySQL Database Storage (replicated for durability)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-data
+  namespace: wordpress
+spec:
+  storageClassName: minio-replicated  # Substrate-backed, replicated storage
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# MySQL Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: wordpress
+type: Opaque
+stringData:
+  root-password: changeme-mysql-root-password
+  database: wordpress
+  user: wordpress
+  password: changeme-wordpress-db-password
+
+---
+# MySQL Database
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql
+  namespace: wordpress
+spec:
+  serviceName: mysql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: root-password
+            - name: MYSQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: database
+            - name: MYSQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: user
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: password
+            - name: MYSQL_ROOT_HOST
+              value: "%"
+          ports:
+            - containerPort: 3306
+              name: mysql
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+          livenessProbe:
+            exec:
+              command:
+                - mysqladmin
+                - ping
+                - -h
+                - localhost
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - mysql
+                - -h
+                - localhost
+                - -u
+                - root
+                - -p$(MYSQL_ROOT_PASSWORD)
+                - -e
+                - "SELECT 1"
+            initialDelaySeconds: 10
+            periodSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: mysql-data
+
+---
+# MySQL Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: wordpress
+spec:
+  selector:
+    app: mysql
+  ports:
+    - port: 3306
+      targetPort: 3306
+  clusterIP: None  # Headless service
+
+---
+# WordPress Storage (standard tier for uploads)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wordpress-data
+  namespace: wordpress
+spec:
+  storageClassName: minio-standard  # Substrate-backed standard storage
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+# WordPress Application
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wordpress
+  namespace: wordpress
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: wordpress
+  template:
+    metadata:
+      labels:
+        app: wordpress
+    spec:
+      containers:
+        - name: wordpress
+          image: wordpress:6.4-apache
+          env:
+            - name: WORDPRESS_DB_HOST
+              value: mysql:3306
+            - name: WORDPRESS_DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: database
+            - name: WORDPRESS_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: user
+            - name: WORDPRESS_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: password
+          ports:
+            - containerPort: 80
+              name: http
+          volumeMounts:
+            - name: wordpress-data
+              mountPath: /var/www/html
+          livenessProbe:
+            httpGet:
+              path: /wp-admin/install.php
+              port: 80
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /wp-admin/install.php
+              port: 80
+            initialDelaySeconds: 30
+            periodSeconds: 5
+      volumes:
+        - name: wordpress-data
+          persistentVolumeClaim:
+            claimName: wordpress-data
+
+---
+# WordPress Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: wordpress
+  namespace: wordpress
+spec:
+  selector:
+    app: wordpress
+  type: LoadBalancer
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP
+      name: http
+
+---
+# Backup CronJob (uses archive storage tier)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: wordpress-backups
+  namespace: wordpress
+spec:
+  storageClassName: minio-archive  # Long-term archive storage
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: wordpress-backup
+  namespace: wordpress
+spec:
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: backup
+              image: mysql:8.0
+              command:
+                - /bin/bash
+                - -c
+                - |
+                  TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+                  BACKUP_FILE="/backups/wordpress_${TIMESTAMP}.sql"
+
+                  echo "Starting backup at ${TIMESTAMP}"
+
+                  # Dump database
+                  mysqldump -h mysql -u root -p${MYSQL_ROOT_PASSWORD} wordpress > ${BACKUP_FILE}
+
+                  # Compress
+                  gzip ${BACKUP_FILE}
+
+                  # Cleanup old backups (keep 90 days, lifecycle handles archival)
+                  find /backups -name "wordpress_*.sql.gz" -mtime +90 -delete
+
+                  echo "Backup complete: ${BACKUP_FILE}.gz"
+              env:
+                - name: MYSQL_ROOT_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-secret
+                      key: root-password
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          restartPolicy: OnFailure
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: wordpress-backups
+
+---
+# What This Demonstrates:
+#
+# 1. Workload Layer (K8s) owns:
+#    - Container orchestration (WordPress pods, MySQL StatefulSet)
+#    - Service discovery (K8s Services)
+#    - Scaling (Deployment replicas)
+#    - Scheduling (Pod placement)
+#
+# 2. Substrate Layer (Globular) owns:
+#    - Storage infrastructure (MinIO)
+#    - Storage tiers (standard, replicated, archive)
+#    - Backups (MinIO buckets backed up by Globular)
+#    - Replication (minio-replicated StorageClass)
+#    - Lifecycle policies (archive tier)
+#
+# 3. Clean Separation:
+#    - Developer uses standard K8s APIs (Deployment, PVC, Service)
+#    - Storage "just works" (backed by substrate MinIO)
+#    - No storage operator to manage
+#    - No circular dependencies
+#    - Disaster recovery = restore substrate
+#
+# Deploy this stack:
+#   kubectl apply -f wordpress-stack.yaml
+#
+# Access WordPress:
+#   kubectl -n wordpress get svc wordpress
+#   # Use EXTERNAL-IP or NodePort
+#
+# Verify substrate integration:
+#   # Check MinIO buckets (substrate layer)
+#   mc ls globular/ | grep k8s-pv
+#
+#   # Check PVCs (workload layer)
+#   kubectl -n wordpress get pvc
+#
+# The magic: WordPress developers don't know or care about MinIO,
+# substrate, convergent installers, or any infrastructure concerns.
+# They just use PVCs. Storage "just works."
+#
+# That's the substrate pattern: infrastructure truth (Globular)
+# separate from workload truth (K8s).

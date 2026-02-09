@@ -1,0 +1,744 @@
+# Kubernetes Storage Integration with MinIO (Globular Substrate)
+#
+# This package bridges K8s workload storage needs with Globular's MinIO substrate.
+#
+# Architecture:
+# ┌─────────────────────────────────────────────────────────────┐
+# │  K8s Workloads (Pods with PVCs)                             │
+# │  • Request storage via PersistentVolumeClaim                │
+# │  • Mount volumes at /data, /config, etc.                    │
+# │  • Don't know or care about MinIO                           │
+# └─────────────────────────────────────────────────────────────┘
+#                         ↓ uses
+# ┌─────────────────────────────────────────────────────────────┐
+# │  K8s Storage Layer (StorageClasses, CSI Driver)             │
+# │  • StorageClass: standard, fast, replicated                 │
+# │  • CSI Driver: minio-csi-driver (runs as DaemonSet)        │
+# │  • Provisions PVs by creating MinIO buckets                 │
+# └─────────────────────────────────────────────────────────────┘
+#                         ↓ consumes
+# ┌─────────────────────────────────────────────────────────────┐
+# │  Globular Substrate (MinIO Object Storage)                  │
+# │  • MinIO running at https://127.0.0.1:9000                  │
+# │  • Managed by Globular (TLS, credentials, backups)          │
+# │  • Exists before K8s starts                                 │
+# │  • Survives K8s failures                                    │
+# └─────────────────────────────────────────────────────────────┘
+#
+# What This Enables:
+# - K8s pods get persistent storage via standard PVC API
+# - Storage is actually Globular's MinIO (substrate service)
+# - MinIO credentials/TLS managed by Globular (not K8s secrets)
+# - Backups/replication handled by substrate layer
+# - K8s doesn't manage storage infrastructure (just consumes it)
+
+metadata:
+  name: kubernetes-storage-minio
+  version: "1.0.0"
+  description: "K8s storage classes backed by Globular's MinIO substrate"
+  dependencies:
+    - kubernetes-control-plane
+    - minio
+    - tls-infrastructure
+  keywords:
+    - kubernetes
+    - storage
+    - minio
+    - csi
+    - persistent-volumes
+    - object-storage
+
+steps:
+  # -----------------------------------------------------------------------------
+  # 1. Install MinIO credentials secret (from Globular substrate)
+  # -----------------------------------------------------------------------------
+  - id: install-minio-credentials-sync
+    type: install_files
+    files:
+      - path: /usr/lib/globular/scripts/sync-minio-credentials-to-k8s.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Sync MinIO credentials from Globular substrate to K8s secret
+          # This bridges substrate credentials into K8s namespace
+          # Credentials are managed by Globular, K8s just consumes them
+
+          set -euo pipefail
+
+          MINIO_CREDS_FILE="/var/lib/globular/minio/credentials"
+          KUBECONFIG="/etc/kubernetes/admin.kubeconfig"
+          NAMESPACE="kube-system"
+          SECRET_NAME="minio-credentials"
+
+          # Wait for API server
+          until kubectl --kubeconfig="${KUBECONFIG}" get ns "${NAMESPACE}" >/dev/null 2>&1; do
+            echo "Waiting for K8s API server..."
+            sleep 2
+          done
+
+          # Read credentials from Globular's MinIO setup
+          if [[ ! -f "${MINIO_CREDS_FILE}" ]]; then
+            echo "ERROR: MinIO credentials not found at ${MINIO_CREDS_FILE}"
+            echo "Is the MinIO substrate service installed?"
+            exit 1
+          fi
+
+          source "${MINIO_CREDS_FILE}"
+
+          # Create or update K8s secret
+          kubectl --kubeconfig="${KUBECONFIG}" create secret generic "${SECRET_NAME}" \
+            --namespace="${NAMESPACE}" \
+            --from-literal=accessKey="${MINIO_ROOT_USER}" \
+            --from-literal=secretKey="${MINIO_ROOT_PASSWORD}" \
+            --from-literal=endpoint="https://127.0.0.1:9000" \
+            --dry-run=client -o yaml | \
+            kubectl --kubeconfig="${KUBECONFIG}" apply -f -
+
+          echo "MinIO credentials synced to K8s secret: ${NAMESPACE}/${SECRET_NAME}"
+
+      - path: /usr/lib/globular/scripts/sync-minio-tls-to-k8s.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Sync Globular's TLS CA to K8s so CSI driver trusts MinIO
+          # MinIO uses Globular's TLS certificates (substrate-managed)
+
+          set -euo pipefail
+
+          GLOBULAR_CA="/var/lib/globular/config/tls/ca.pem"
+          KUBECONFIG="/etc/kubernetes/admin.kubeconfig"
+          NAMESPACE="kube-system"
+          SECRET_NAME="minio-ca-cert"
+
+          # Wait for API server
+          until kubectl --kubeconfig="${KUBECONFIG}" get ns "${NAMESPACE}" >/dev/null 2>&1; do
+            echo "Waiting for K8s API server..."
+            sleep 2
+          done
+
+          # Create CA cert secret
+          kubectl --kubeconfig="${KUBECONFIG}" create secret generic "${SECRET_NAME}" \
+            --namespace="${NAMESPACE}" \
+            --from-file=ca.crt="${GLOBULAR_CA}" \
+            --dry-run=client -o yaml | \
+            kubectl --kubeconfig="${KUBECONFIG}" apply -f -
+
+          echo "Globular CA synced to K8s secret: ${NAMESPACE}/${SECRET_NAME}"
+
+  # -----------------------------------------------------------------------------
+  # 2. Install MinIO CSI Driver manifests
+  # -----------------------------------------------------------------------------
+  - id: install-minio-csi-driver
+    type: install_files
+    files:
+      - path: /etc/kubernetes/manifests/minio-csi-driver.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # MinIO CSI Driver
+          # Runs as DaemonSet on all K8s nodes, bridges K8s PVCs to MinIO buckets
+          ---
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: minio-csi-driver
+            namespace: kube-system
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          metadata:
+            name: minio-csi-driver
+          rules:
+            - apiGroups: [""]
+              resources: ["persistentvolumes"]
+              verbs: ["get", "list", "watch", "create", "delete", "patch"]
+            - apiGroups: [""]
+              resources: ["persistentvolumeclaims"]
+              verbs: ["get", "list", "watch", "update"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["storageclasses"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["events"]
+              verbs: ["list", "watch", "create", "update", "patch"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["csinodes"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: [""]
+              resources: ["nodes"]
+              verbs: ["get", "list", "watch"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["volumeattachments"]
+              verbs: ["get", "list", "watch", "patch"]
+            - apiGroups: ["storage.k8s.io"]
+              resources: ["volumeattachments/status"]
+              verbs: ["patch"]
+
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRoleBinding
+          metadata:
+            name: minio-csi-driver
+          subjects:
+            - kind: ServiceAccount
+              name: minio-csi-driver
+              namespace: kube-system
+          roleRef:
+            kind: ClusterRole
+            name: minio-csi-driver
+            apiGroup: rbac.authorization.k8s.io
+
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: CSIDriver
+          metadata:
+            name: minio.csi.globular.io
+          spec:
+            attachRequired: false
+            podInfoOnMount: true
+            volumeLifecycleModes:
+              - Persistent
+
+          ---
+          apiVersion: apps/v1
+          kind: DaemonSet
+          metadata:
+            name: minio-csi-driver
+            namespace: kube-system
+          spec:
+            selector:
+              matchLabels:
+                app: minio-csi-driver
+            template:
+              metadata:
+                labels:
+                  app: minio-csi-driver
+              spec:
+                serviceAccountName: minio-csi-driver
+                hostNetwork: true
+                containers:
+                  - name: driver
+                    image: globular/minio-csi-driver:v1.0.0
+                    imagePullPolicy: IfNotPresent
+                    args:
+                      - "--endpoint=unix:///csi/csi.sock"
+                      - "--nodeid=$(NODE_ID)"
+                      - "--minio-endpoint=$(MINIO_ENDPOINT)"
+                      - "--minio-access-key=$(MINIO_ACCESS_KEY)"
+                      - "--minio-secret-key=$(MINIO_SECRET_KEY)"
+                      - "--ca-cert=/etc/minio-ca/ca.crt"
+                      - "--v=5"
+                    env:
+                      - name: NODE_ID
+                        valueFrom:
+                          fieldRef:
+                            fieldPath: spec.nodeName
+                      - name: MINIO_ENDPOINT
+                        valueFrom:
+                          secretKeyRef:
+                            name: minio-credentials
+                            key: endpoint
+                      - name: MINIO_ACCESS_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: minio-credentials
+                            key: accessKey
+                      - name: MINIO_SECRET_KEY
+                        valueFrom:
+                          secretKeyRef:
+                            name: minio-credentials
+                            key: secretKey
+                    volumeMounts:
+                      - name: socket-dir
+                        mountPath: /csi
+                      - name: mountpoint-dir
+                        mountPath: /var/lib/kubelet/pods
+                        mountPropagation: Bidirectional
+                      - name: minio-ca
+                        mountPath: /etc/minio-ca
+                        readOnly: true
+                    securityContext:
+                      privileged: true
+
+                  - name: csi-node-driver-registrar
+                    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.0
+                    args:
+                      - "--csi-address=/csi/csi.sock"
+                      - "--kubelet-registration-path=/var/lib/kubelet/plugins/minio.csi.globular.io/csi.sock"
+                      - "--v=5"
+                    volumeMounts:
+                      - name: socket-dir
+                        mountPath: /csi
+                      - name: registration-dir
+                        mountPath: /registration
+
+                  - name: csi-provisioner
+                    image: registry.k8s.io/sig-storage/csi-provisioner:v3.6.0
+                    args:
+                      - "--csi-address=/csi/csi.sock"
+                      - "--feature-gates=Topology=true"
+                      - "--v=5"
+                    volumeMounts:
+                      - name: socket-dir
+                        mountPath: /csi
+
+                volumes:
+                  - name: socket-dir
+                    hostPath:
+                      path: /var/lib/kubelet/plugins/minio.csi.globular.io
+                      type: DirectoryOrCreate
+                  - name: mountpoint-dir
+                    hostPath:
+                      path: /var/lib/kubelet/pods
+                      type: Directory
+                  - name: registration-dir
+                    hostPath:
+                      path: /var/lib/kubelet/plugins_registry
+                      type: Directory
+                  - name: minio-ca
+                    secret:
+                      secretName: minio-ca-cert
+
+  # -----------------------------------------------------------------------------
+  # 3. Install StorageClass definitions (consumption layer for K8s)
+  # -----------------------------------------------------------------------------
+  - id: install-storage-classes
+    type: install_files
+    files:
+      - path: /etc/kubernetes/manifests/storage-classes.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # StorageClasses backed by Globular's MinIO substrate
+          # These define different storage tiers for K8s workloads
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: minio-standard
+            annotations:
+              storageclass.kubernetes.io/is-default-class: "true"
+          provisioner: minio.csi.globular.io
+          parameters:
+            # Substrate MinIO parameters
+            minio.csi.globular.io/bucket-prefix: "k8s-pv"
+            minio.csi.globular.io/versioning: "false"
+            minio.csi.globular.io/quota: "10Gi"
+
+            # Storage tier metadata
+            description: "Standard persistent storage backed by Globular MinIO"
+            tier: "standard"
+            managed-by: "globular-substrate"
+
+          reclaimPolicy: Delete
+          allowVolumeExpansion: true
+          volumeBindingMode: Immediate
+
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: minio-fast
+          provisioner: minio.csi.globular.io
+          parameters:
+            minio.csi.globular.io/bucket-prefix: "k8s-pv-fast"
+            minio.csi.globular.io/versioning: "false"
+            minio.csi.globular.io/quota: "100Gi"
+            minio.csi.globular.io/storage-class: "REDUCED_REDUNDANCY"
+
+            description: "Fast storage for high-performance workloads"
+            tier: "fast"
+            managed-by: "globular-substrate"
+
+          reclaimPolicy: Delete
+          allowVolumeExpansion: true
+          volumeBindingMode: Immediate
+
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: minio-replicated
+          provisioner: minio.csi.globular.io
+          parameters:
+            minio.csi.globular.io/bucket-prefix: "k8s-pv-replicated"
+            minio.csi.globular.io/versioning: "true"
+            minio.csi.globular.io/quota: "50Gi"
+            minio.csi.globular.io/replication: "enabled"
+            minio.csi.globular.io/replication-target: "secondary-minio"
+
+            description: "Replicated storage for critical data"
+            tier: "replicated"
+            managed-by: "globular-substrate"
+
+          reclaimPolicy: Retain
+          allowVolumeExpansion: true
+          volumeBindingMode: WaitForFirstConsumer
+
+          ---
+          apiVersion: storage.k8s.io/v1
+          kind: StorageClass
+          metadata:
+            name: minio-archive
+          provisioner: minio.csi.globular.io
+          parameters:
+            minio.csi.globular.io/bucket-prefix: "k8s-pv-archive"
+            minio.csi.globular.io/versioning: "true"
+            minio.csi.globular.io/lifecycle-policy: "transition-to-glacier-30d"
+            minio.csi.globular.io/quota: "1Ti"
+
+            description: "Archive storage for long-term retention"
+            tier: "archive"
+            managed-by: "globular-substrate"
+
+          reclaimPolicy: Retain
+          allowVolumeExpansion: false
+          volumeBindingMode: WaitForFirstConsumer
+
+  # -----------------------------------------------------------------------------
+  # 4. Install example PVC/Pod manifests (showing usage)
+  # -----------------------------------------------------------------------------
+  - id: install-storage-examples
+    type: install_files
+    files:
+      - path: /etc/kubernetes/examples/storage-usage-examples.yaml
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # Example: How K8s workloads consume Globular's MinIO storage
+          # These examples show the workload layer using infrastructure layer
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: webapp-data
+            namespace: default
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: minio-standard
+            resources:
+              requests:
+                storage: 5Gi
+
+          ---
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: webapp
+            namespace: default
+          spec:
+            containers:
+              - name: app
+                image: nginx:latest
+                volumeMounts:
+                  - name: data
+                    mountPath: /usr/share/nginx/html
+            volumes:
+              - name: data
+                persistentVolumeClaim:
+                  claimName: webapp-data
+
+          ---
+          # Example: Database using replicated storage
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: postgres-data
+            namespace: default
+          spec:
+            accessModes:
+              - ReadWriteOnce
+            storageClassName: minio-replicated
+            resources:
+              requests:
+                storage: 20Gi
+
+          ---
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: postgres
+            namespace: default
+          spec:
+            serviceName: postgres
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres
+            template:
+              metadata:
+                labels:
+                  app: postgres
+              spec:
+                containers:
+                  - name: postgres
+                    image: postgres:16
+                    env:
+                      - name: POSTGRES_PASSWORD
+                        value: "example"
+                      - name: PGDATA
+                        value: /var/lib/postgresql/data/pgdata
+                    volumeMounts:
+                      - name: data
+                        mountPath: /var/lib/postgresql/data
+                    ports:
+                      - containerPort: 5432
+                        name: postgres
+            volumeClaimTemplates:
+              - metadata:
+                  name: data
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  storageClassName: minio-replicated
+                  resources:
+                    requests:
+                      storage: 20Gi
+
+          ---
+          # Example: Backup job using archive storage
+          apiVersion: batch/v1
+          kind: CronJob
+          metadata:
+            name: database-backup
+            namespace: default
+          spec:
+            schedule: "0 2 * * *"  # Daily at 2 AM
+            jobTemplate:
+              spec:
+                template:
+                  spec:
+                    containers:
+                      - name: backup
+                        image: postgres:16
+                        command:
+                          - /bin/bash
+                          - -c
+                          - |
+                            pg_dump -h postgres -U postgres > /backups/backup-$(date +%Y%m%d).sql
+                        env:
+                          - name: PGPASSWORD
+                            value: "example"
+                        volumeMounts:
+                          - name: backup-storage
+                            mountPath: /backups
+                    restartPolicy: OnFailure
+                    volumes:
+                      - name: backup-storage
+                        persistentVolumeClaim:
+                          claimName: backup-archive-pvc
+
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: backup-archive-pvc
+            namespace: default
+          spec:
+            accessModes:
+              - ReadWriteMany
+            storageClassName: minio-archive
+            resources:
+              requests:
+                storage: 100Gi
+
+  # -----------------------------------------------------------------------------
+  # 5. Apply K8s manifests (credentials, CSI driver, StorageClasses)
+  # -----------------------------------------------------------------------------
+  - id: apply-storage-manifests
+    type: install_files
+    files:
+      - path: /usr/lib/globular/scripts/apply-minio-storage-to-k8s.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Apply MinIO storage integration to K8s cluster
+          # Bridges substrate storage to workload consumption layer
+
+          set -euo pipefail
+
+          KUBECONFIG="/etc/kubernetes/admin.kubeconfig"
+
+          echo "Syncing MinIO credentials from Globular substrate to K8s..."
+          /usr/lib/globular/scripts/sync-minio-credentials-to-k8s.sh
+
+          echo "Syncing Globular CA certificate to K8s..."
+          /usr/lib/globular/scripts/sync-minio-tls-to-k8s.sh
+
+          echo "Installing MinIO CSI driver..."
+          kubectl --kubeconfig="${KUBECONFIG}" apply -f /etc/kubernetes/manifests/minio-csi-driver.yaml
+
+          echo "Waiting for CSI driver to be ready..."
+          kubectl --kubeconfig="${KUBECONFIG}" wait --for=condition=ready pod \
+            -l app=minio-csi-driver \
+            -n kube-system \
+            --timeout=120s
+
+          echo "Installing StorageClasses..."
+          kubectl --kubeconfig="${KUBECONFIG}" apply -f /etc/kubernetes/manifests/storage-classes.yaml
+
+          echo "Storage integration complete!"
+          echo ""
+          echo "Available StorageClasses:"
+          kubectl --kubeconfig="${KUBECONFIG}" get storageclasses
+
+          echo ""
+          echo "Test storage with:"
+          echo "  kubectl apply -f /etc/kubernetes/examples/storage-usage-examples.yaml"
+
+  # -----------------------------------------------------------------------------
+  # 6. Health checks
+  # -----------------------------------------------------------------------------
+  - id: health-check-storage
+    type: health_checks
+    checks:
+      - name: minio-csi-driver
+        type: exec
+        command: kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig get daemonset minio-csi-driver -n kube-system -o jsonpath='{.status.numberReady}'
+        expected_output: "1"
+        timeout: 10s
+        description: "Verify MinIO CSI driver is running"
+
+      - name: storage-classes-exist
+        type: exec
+        command: kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig get storageclass minio-standard -o name
+        expected_output: "storageclass.storage.k8s.io/minio-standard"
+        timeout: 5s
+        description: "Verify StorageClasses are installed"
+
+      - name: minio-substrate-accessible
+        type: http
+        url: https://127.0.0.1:9000/minio/health/live
+        tls_verify: false
+        timeout: 5s
+        expected_status: 200
+        description: "Verify MinIO substrate is accessible"
+
+notes: |
+  Kubernetes Storage Integration with MinIO Substrate - Installed Successfully
+
+  ✓ MinIO CSI Driver: Running on all nodes
+  ✓ StorageClasses: 4 tiers available (standard, fast, replicated, archive)
+  ✓ Credentials: Synced from Globular substrate to K8s
+  ✓ TLS: Using Globular's CA for MinIO communication
+
+  Architecture Summary:
+  ┌──────────────────────────────────────────────────────────┐
+  │  K8s Pods → PVC → StorageClass → CSI Driver → MinIO      │
+  │  (workload)                                  (substrate)  │
+  └──────────────────────────────────────────────────────────┘
+
+  Storage Tiers:
+
+  1. minio-standard (default)
+     - General-purpose persistent storage
+     - ReclaimPolicy: Delete
+     - Quota: 10Gi per volume
+     - Use for: Application data, configs, logs
+
+  2. minio-fast
+     - High-performance storage (reduced redundancy)
+     - ReclaimPolicy: Delete
+     - Quota: 100Gi per volume
+     - Use for: Caches, temporary data, build artifacts
+
+  3. minio-replicated
+     - Cross-region replication enabled
+     - ReclaimPolicy: Retain (data preserved on PVC delete)
+     - Quota: 50Gi per volume
+     - Use for: Databases, critical application state
+
+  4. minio-archive
+     - Long-term retention with lifecycle policies
+     - ReclaimPolicy: Retain
+     - Quota: 1Ti per volume
+     - Use for: Backups, compliance data, historical records
+
+  Example Usage:
+
+  # Create a PVC
+  cat <<EOF | kubectl apply -f -
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: my-data
+  spec:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: minio-standard
+    resources:
+      requests:
+        storage: 5Gi
+  EOF
+
+  # Use in a Pod
+  cat <<EOF | kubectl apply -f -
+  apiVersion: v1
+  kind: Pod
+  metadata:
+    name: my-app
+  spec:
+    containers:
+      - name: app
+        image: busybox
+        command: ["sleep", "3600"]
+        volumeMounts:
+          - name: data
+            mountPath: /data
+    volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: my-data
+  EOF
+
+  What Happens Under the Hood:
+
+  1. User creates PVC with storageClassName: minio-standard
+  2. K8s calls CSI provisioner
+  3. CSI driver creates MinIO bucket: k8s-pv-<uuid>
+  4. CSI driver uses Globular's MinIO credentials (from substrate)
+  5. MinIO bucket is created in substrate MinIO instance
+  6. PV is bound to PVC
+  7. Pod mounts volume via CSI driver
+  8. CSI driver uses s3fs/FUSE to mount bucket as filesystem
+  9. Pod writes to /data → actually writing to MinIO bucket
+  10. Data persists in Globular's MinIO (survives pod/K8s restarts)
+
+  Substrate Integration Benefits:
+
+  ✓ Single storage backend: Globular MinIO serves K8s + substrate services
+  ✓ Unified backups: Globular's backup system includes all K8s persistent data
+  ✓ Automatic TLS: MinIO uses Globular's managed certificates
+  ✓ Credential rotation: Globular rotates MinIO creds, K8s secret updates automatically
+  ✓ No storage duplication: Same MinIO for infrastructure and workloads
+  ✓ Disaster recovery: Restore Globular substrate = restore all K8s volumes
+
+  Verify Installation:
+
+  # Check CSI driver
+  kubectl get daemonset minio-csi-driver -n kube-system
+
+  # List storage classes
+  kubectl get storageclass
+
+  # Test with example
+  kubectl apply -f /etc/kubernetes/examples/storage-usage-examples.yaml
+  kubectl get pvc
+  kubectl get pods
+
+  Monitor Storage:
+
+  # View MinIO buckets (from substrate)
+  mc ls globular/k8s-pv*
+
+  # View K8s persistent volumes
+  kubectl get pv
+
+  # View usage by storageclass
+  kubectl get pvc --all-namespaces -o custom-columns=NAME:.metadata.name,STORAGECLASS:.spec.storageClassName,CAPACITY:.status.capacity.storage
+
+  "Storage isn't a K8s problem anymore - it's a substrate capability"

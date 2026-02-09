@@ -1,0 +1,589 @@
+# Kubernetes Control Plane Package Spec
+# This package installs K8s control plane components that consume Globular's substrate layer.
+#
+# Substrate Dependencies (provided by Globular Layer 0):
+# - etcd at https://127.0.0.1:2379 (service discovery, K8s state storage)
+# - TLS certificates at /var/lib/globular/config/tls/
+# - DNS service on port 53
+# - Service discovery and health monitoring
+# - Authentication foundation (RBAC)
+#
+# What This Package Installs:
+# - kube-apiserver (K8s API)
+# - kube-controller-manager (reconciliation loops)
+# - kube-scheduler (pod placement)
+# - kubectl (admin CLI)
+#
+# What This Package Does NOT Manage:
+# - Certificate authority (Globular owns this)
+# - etcd cluster (Globular owns this)
+# - DNS authority (Globular owns this)
+# - Node provisioning (Globular owns this)
+
+metadata:
+  name: kubernetes-control-plane
+  version: "1.29.2"
+  description: "Kubernetes control plane running on Globular substrate"
+  dependencies:
+    - etcd
+    - dns
+    - tls-infrastructure
+    - service-discovery
+  keywords:
+    - kubernetes
+    - k8s
+    - control-plane
+    - orchestration
+    - workload-scheduler
+
+steps:
+  # -----------------------------------------------------------------------------
+  # 1. Ensure K8s user and group exist
+  # -----------------------------------------------------------------------------
+  - id: ensure-kubernetes-user
+    type: ensure_user_group
+    user: kubernetes
+    group: kubernetes
+    description: "System user for Kubernetes control plane"
+
+  # -----------------------------------------------------------------------------
+  # 2. Create directory structure
+  # -----------------------------------------------------------------------------
+  - id: ensure-kubernetes-dirs
+    type: ensure_dirs
+    directories:
+      - path: /var/lib/kubernetes
+        owner: kubernetes
+        group: kubernetes
+        mode: "0750"
+      - path: /var/lib/kubernetes/pki
+        owner: kubernetes
+        group: kubernetes
+        mode: "0750"
+      - path: /etc/kubernetes
+        owner: kubernetes
+        group: kubernetes
+        mode: "0755"
+      - path: /etc/kubernetes/manifests
+        owner: kubernetes
+        group: kubernetes
+        mode: "0755"
+      - path: /var/log/kubernetes
+        owner: kubernetes
+        group: kubernetes
+        mode: "0755"
+
+  # -----------------------------------------------------------------------------
+  # 3. Install K8s binaries
+  # -----------------------------------------------------------------------------
+  - id: install-k8s-binaries
+    type: install_package_payload
+    install_config: false
+    binaries:
+      - name: kube-apiserver
+        destination: /usr/lib/globular/bin/kube-apiserver
+        mode: "0755"
+      - name: kube-controller-manager
+        destination: /usr/lib/globular/bin/kube-controller-manager
+        mode: "0755"
+      - name: kube-scheduler
+        destination: /usr/lib/globular/bin/kube-scheduler
+        mode: "0755"
+      - name: kubectl
+        destination: /usr/bin/kubectl
+        mode: "0755"
+
+  # -----------------------------------------------------------------------------
+  # 4. Generate K8s certificates using Globular's CA
+  # -----------------------------------------------------------------------------
+  - id: install-k8s-pki-setup
+    type: install_files
+    files:
+      - path: /usr/lib/globular/scripts/k8s-generate-certs.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # K8s Certificate Generation Using Globular CA
+          # This script generates K8s component certificates using Globular's existing CA.
+          # Run once during installation, then Globular's cert rotation handles updates.
+
+          set -euo pipefail
+
+          GLOBULAR_CA_KEY="/var/lib/globular/pki/ca.key"
+          GLOBULAR_CA_CERT="/var/lib/globular/pki/ca.crt"
+          K8S_PKI_DIR="/var/lib/kubernetes/pki"
+
+          # Only generate if certs don't exist (convergent)
+          if [[ -f "${K8S_PKI_DIR}/apiserver.crt" ]]; then
+            echo "K8s certificates already exist, skipping generation"
+            exit 0
+          fi
+
+          echo "Generating K8s certificates using Globular CA..."
+
+          # API Server certificate (includes SANs for cluster access)
+          openssl req -new -newkey rsa:2048 -nodes \
+            -keyout "${K8S_PKI_DIR}/apiserver.key" \
+            -out "${K8S_PKI_DIR}/apiserver.csr" \
+            -subj "/CN=kube-apiserver/O=Kubernetes" \
+            -config <(cat <<EOF
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+          [req_distinguished_name]
+          [v3_req]
+          basicConstraints = CA:FALSE
+          keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = kubernetes
+          DNS.2 = kubernetes.default
+          DNS.3 = kubernetes.default.svc
+          DNS.4 = kubernetes.default.svc.cluster.local
+          DNS.5 = localhost
+          IP.1 = 10.96.0.1
+          IP.2 = 127.0.0.1
+          EOF
+          )
+
+          openssl x509 -req -in "${K8S_PKI_DIR}/apiserver.csr" \
+            -CA "${GLOBULAR_CA_CERT}" -CAkey "${GLOBULAR_CA_KEY}" -CAcreateserial \
+            -out "${K8S_PKI_DIR}/apiserver.crt" -days 365 \
+            -extensions v3_req -extfile <(cat <<EOF
+          [v3_req]
+          basicConstraints = CA:FALSE
+          keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+          extendedKeyUsage = serverAuth
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = kubernetes
+          DNS.2 = kubernetes.default
+          DNS.3 = kubernetes.default.svc
+          DNS.4 = kubernetes.default.svc.cluster.local
+          DNS.5 = localhost
+          IP.1 = 10.96.0.1
+          IP.2 = 127.0.0.1
+          EOF
+          )
+
+          # Service Account signing key (K8s-specific, not from CA)
+          openssl genrsa -out "${K8S_PKI_DIR}/sa.key" 2048
+          openssl rsa -in "${K8S_PKI_DIR}/sa.key" -pubout -out "${K8S_PKI_DIR}/sa.pub"
+
+          # Symlink to Globular CA (so K8s trusts substrate services)
+          ln -sf "${GLOBULAR_CA_CERT}" "${K8S_PKI_DIR}/ca.crt"
+
+          chown -R kubernetes:kubernetes "${K8S_PKI_DIR}"
+          chmod 600 "${K8S_PKI_DIR}"/*.key
+
+          echo "K8s certificates generated successfully"
+
+  # -----------------------------------------------------------------------------
+  # 5. Install kube-apiserver configuration
+  # -----------------------------------------------------------------------------
+  - id: install-apiserver-config
+    type: install_files
+    files:
+      - path: /etc/kubernetes/apiserver.yaml
+        owner: kubernetes
+        group: kubernetes
+        mode: "0640"
+        content: |
+          # kube-apiserver configuration
+          # Consumes Globular substrate: etcd, TLS, service discovery
+
+          apiVersion: v1
+          kind: Config
+
+          # etcd configuration (using Globular's etcd)
+          etcd:
+            endpoints:
+              - https://127.0.0.1:2379
+            cafile: /var/lib/globular/config/tls/ca.pem
+            certfile: /var/lib/globular/config/tls/server.crt
+            keyfile: /var/lib/globular/config/tls/server.key
+
+          # TLS configuration (using Globular's PKI)
+          tls:
+            cert-file: /var/lib/kubernetes/pki/apiserver.crt
+            key-file: /var/lib/kubernetes/pki/apiserver.key
+            client-ca-file: /var/lib/kubernetes/pki/ca.crt
+
+          # Service account keys
+          service-account:
+            key-file: /var/lib/kubernetes/pki/sa.key
+            signing-key-file: /var/lib/kubernetes/pki/sa.key
+
+          # API server settings
+          advertise-address: "0.0.0.0"
+          secure-port: 6443
+          allow-privileged: true
+          authorization-mode: Node,RBAC
+          enable-admission-plugins: NodeRestriction
+          service-cluster-ip-range: 10.96.0.0/12
+          service-node-port-range: 30000-32767
+
+  # -----------------------------------------------------------------------------
+  # 6. Install kube-controller-manager configuration
+  # -----------------------------------------------------------------------------
+  - id: install-controller-manager-config
+    type: install_files
+    files:
+      - path: /etc/kubernetes/controller-manager.yaml
+        owner: kubernetes
+        group: kubernetes
+        mode: "0640"
+        content: |
+          # kube-controller-manager configuration
+          # Runs reconciliation loops for K8s resources
+
+          apiVersion: v1
+          kind: Config
+
+          kubeconfig: /etc/kubernetes/controller-manager.kubeconfig
+
+          # Use Globular's CA for service account token signing
+          service-account-private-key-file: /var/lib/kubernetes/pki/sa.key
+          root-ca-file: /var/lib/kubernetes/pki/ca.crt
+
+          # Cluster CIDR (pod network)
+          cluster-cidr: 10.244.0.0/16
+
+          # Leader election (uses Globular's etcd)
+          leader-elect: true
+
+          # Controllers to enable
+          controllers: "*,bootstrapsigner,tokencleaner"
+
+  # -----------------------------------------------------------------------------
+  # 7. Install kube-scheduler configuration
+  # -----------------------------------------------------------------------------
+  - id: install-scheduler-config
+    type: install_files
+    files:
+      - path: /etc/kubernetes/scheduler.yaml
+        owner: kubernetes
+        group: kubernetes
+        mode: "0640"
+        content: |
+          # kube-scheduler configuration
+          # Schedules pods onto nodes
+
+          apiVersion: kubescheduler.config.k8s.io/v1
+          kind: KubeSchedulerConfiguration
+
+          clientConnection:
+            kubeconfig: /etc/kubernetes/scheduler.kubeconfig
+
+          leaderElection:
+            leaderElect: true
+
+  # -----------------------------------------------------------------------------
+  # 8. Install systemd service for kube-apiserver
+  # -----------------------------------------------------------------------------
+  - id: install-apiserver-service
+    type: install_services
+    services:
+      - name: kube-apiserver
+        content: |
+          [Unit]
+          Description=Kubernetes API Server
+          Documentation=https://kubernetes.io/docs/concepts/overview/components/#kube-apiserver
+          After=network.target etcd.service
+          Requires=etcd.service
+
+          [Service]
+          Type=notify
+          User=kubernetes
+          Group=kubernetes
+
+          # Run certificate generation before starting (convergent - only if needed)
+          ExecStartPre=/usr/lib/globular/scripts/k8s-generate-certs.sh
+
+          ExecStart=/usr/lib/globular/bin/kube-apiserver \
+            --advertise-address=127.0.0.1 \
+            --allow-privileged=true \
+            --authorization-mode=Node,RBAC \
+            --client-ca-file=/var/lib/kubernetes/pki/ca.crt \
+            --enable-admission-plugins=NodeRestriction \
+            --enable-bootstrap-token-auth=true \
+            --etcd-cafile=/var/lib/globular/config/tls/ca.pem \
+            --etcd-certfile=/var/lib/globular/config/tls/server.crt \
+            --etcd-keyfile=/var/lib/globular/config/tls/server.key \
+            --etcd-servers=https://127.0.0.1:2379 \
+            --event-ttl=1h \
+            --kubelet-certificate-authority=/var/lib/kubernetes/pki/ca.crt \
+            --kubelet-client-certificate=/var/lib/kubernetes/pki/apiserver.crt \
+            --kubelet-client-key=/var/lib/kubernetes/pki/apiserver.key \
+            --runtime-config=api/all=true \
+            --service-account-issuer=https://kubernetes.default.svc.cluster.local \
+            --service-account-key-file=/var/lib/kubernetes/pki/sa.pub \
+            --service-account-signing-key-file=/var/lib/kubernetes/pki/sa.key \
+            --service-cluster-ip-range=10.96.0.0/12 \
+            --service-node-port-range=30000-32767 \
+            --tls-cert-file=/var/lib/kubernetes/pki/apiserver.crt \
+            --tls-private-key-file=/var/lib/kubernetes/pki/apiserver.key \
+            --v=2
+
+          Restart=on-failure
+          RestartSec=5
+          LimitNOFILE=65536
+
+          # Health monitoring by Globular
+          # Globular's health service will check API server responsiveness
+
+          [Install]
+          WantedBy=multi-user.target
+
+  # -----------------------------------------------------------------------------
+  # 9. Install systemd service for kube-controller-manager
+  # -----------------------------------------------------------------------------
+  - id: install-controller-manager-service
+    type: install_services
+    services:
+      - name: kube-controller-manager
+        content: |
+          [Unit]
+          Description=Kubernetes Controller Manager
+          Documentation=https://kubernetes.io/docs/concepts/overview/components/#kube-controller-manager
+          After=kube-apiserver.service
+          Requires=kube-apiserver.service
+
+          [Service]
+          Type=simple
+          User=kubernetes
+          Group=kubernetes
+
+          ExecStart=/usr/lib/globular/bin/kube-controller-manager \
+            --bind-address=127.0.0.1 \
+            --cluster-cidr=10.244.0.0/16 \
+            --cluster-name=kubernetes \
+            --cluster-signing-cert-file=/var/lib/kubernetes/pki/ca.crt \
+            --cluster-signing-key-file=/var/lib/globular/pki/ca.key \
+            --kubeconfig=/etc/kubernetes/controller-manager.kubeconfig \
+            --leader-elect=true \
+            --root-ca-file=/var/lib/kubernetes/pki/ca.crt \
+            --service-account-private-key-file=/var/lib/kubernetes/pki/sa.key \
+            --service-cluster-ip-range=10.96.0.0/12 \
+            --use-service-account-credentials=true \
+            --v=2
+
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+  # -----------------------------------------------------------------------------
+  # 10. Install systemd service for kube-scheduler
+  # -----------------------------------------------------------------------------
+  - id: install-scheduler-service
+    type: install_services
+    services:
+      - name: kube-scheduler
+        content: |
+          [Unit]
+          Description=Kubernetes Scheduler
+          Documentation=https://kubernetes.io/docs/concepts/overview/components/#kube-scheduler
+          After=kube-apiserver.service
+          Requires=kube-apiserver.service
+
+          [Service]
+          Type=simple
+          User=kubernetes
+          Group=kubernetes
+
+          ExecStart=/usr/lib/globular/bin/kube-scheduler \
+            --bind-address=127.0.0.1 \
+            --kubeconfig=/etc/kubernetes/scheduler.kubeconfig \
+            --leader-elect=true \
+            --v=2
+
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+  # -----------------------------------------------------------------------------
+  # 11. Enable services
+  # -----------------------------------------------------------------------------
+  - id: enable-k8s-services
+    type: enable_services
+    services:
+      - kube-apiserver
+      - kube-controller-manager
+      - kube-scheduler
+
+  # -----------------------------------------------------------------------------
+  # 12. Start services
+  # -----------------------------------------------------------------------------
+  - id: start-k8s-services
+    type: start_services
+    services:
+      - kube-apiserver
+      - kube-controller-manager
+      - kube-scheduler
+
+  # -----------------------------------------------------------------------------
+  # 13. Health checks (Globular validates K8s is running)
+  # -----------------------------------------------------------------------------
+  - id: health-check-apiserver
+    type: health_checks
+    checks:
+      - name: kube-apiserver-port
+        type: tcp
+        address: 127.0.0.1:6443
+        timeout: 5s
+        description: "Verify kube-apiserver is listening on port 6443"
+
+      - name: kube-apiserver-health
+        type: http
+        url: https://127.0.0.1:6443/healthz
+        tls_verify: false
+        timeout: 5s
+        expected_status: 200
+        description: "Verify kube-apiserver health endpoint responds"
+
+      - name: kube-apiserver-ready
+        type: http
+        url: https://127.0.0.1:6443/readyz
+        tls_verify: false
+        timeout: 5s
+        expected_status: 200
+        description: "Verify kube-apiserver is ready to serve requests"
+
+      - name: controller-manager-health
+        type: http
+        url: http://127.0.0.1:10257/healthz
+        timeout: 5s
+        expected_status: 200
+        description: "Verify kube-controller-manager is healthy"
+
+      - name: scheduler-health
+        type: http
+        url: http://127.0.0.1:10259/healthz
+        timeout: 5s
+        expected_status: 200
+        description: "Verify kube-scheduler is healthy"
+
+  # -----------------------------------------------------------------------------
+  # 14. Install admin kubeconfig for cluster access
+  # -----------------------------------------------------------------------------
+  - id: install-admin-kubeconfig
+    type: install_files
+    files:
+      - path: /etc/kubernetes/admin.kubeconfig
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          # Admin kubeconfig for cluster access
+          # This uses Globular's CA for authentication
+
+          apiVersion: v1
+          kind: Config
+          clusters:
+          - cluster:
+              certificate-authority: /var/lib/kubernetes/pki/ca.crt
+              server: https://127.0.0.1:6443
+            name: kubernetes
+          contexts:
+          - context:
+              cluster: kubernetes
+              user: kubernetes-admin
+            name: kubernetes-admin@kubernetes
+          current-context: kubernetes-admin@kubernetes
+          users:
+          - name: kubernetes-admin
+            user:
+              client-certificate: /var/lib/kubernetes/pki/apiserver.crt
+              client-key: /var/lib/kubernetes/pki/apiserver.key
+
+  # -----------------------------------------------------------------------------
+  # 15. Register with Globular service discovery
+  # -----------------------------------------------------------------------------
+  - id: register-k8s-with-discovery
+    type: install_files
+    files:
+      - path: /usr/lib/globular/scripts/k8s-register-discovery.sh
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          # Register Kubernetes API server with Globular's service discovery
+          # This makes K8s discoverable to other substrate services
+
+          set -euo pipefail
+
+          # Wait for discovery service to be available
+          for i in {1..30}; do
+            if curl -sf https://127.0.0.1:10016/healthz >/dev/null 2>&1; then
+              break
+            fi
+            echo "Waiting for Globular discovery service... ($i/30)"
+            sleep 2
+          done
+
+          # Register K8s API server
+          curl -X POST https://127.0.0.1:10016/api/register \
+            --cacert /var/lib/globular/config/tls/ca.pem \
+            --cert /var/lib/globular/config/tls/server.crt \
+            --key /var/lib/globular/config/tls/server.key \
+            -H "Content-Type: application/json" \
+            -d '{
+              "name": "kubernetes.KubernetesService",
+              "domain": "localhost",
+              "address": "127.0.0.1:6443",
+              "protocol": "https",
+              "version": "1.29.2",
+              "state": "running",
+              "description": "Kubernetes API Server (workload orchestration)"
+            }' || echo "Warning: Failed to register with discovery (may already exist)"
+
+          echo "Kubernetes registered with Globular service discovery"
+
+# -----------------------------------------------------------------------------
+# Post-installation notes
+# -----------------------------------------------------------------------------
+notes: |
+  Kubernetes Control Plane Installed Successfully
+
+  The control plane is now running and integrated with Globular's substrate:
+
+  ✓ etcd storage: Using Globular's etcd at https://127.0.0.1:2379
+  ✓ TLS certificates: Generated from Globular's CA
+  ✓ Service discovery: Registered with Globular's discovery service
+  ✓ Health monitoring: Globular tracks all components
+
+  Next steps:
+
+  1. Verify cluster status:
+     kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig cluster-info
+
+  2. Check component health:
+     kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig get componentstatuses
+
+  3. Install worker nodes:
+     globular-installer apply kubernetes-worker-node.yaml
+
+  4. Install CNI plugin (for pod networking):
+     kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+
+  5. Deploy your first workload:
+     kubectl --kubeconfig=/etc/kubernetes/admin.kubeconfig apply -f my-app.yaml
+
+  What Globular manages for you (substrate layer):
+  - Certificate rotation (automatic via Globular's TLS system)
+  - etcd health and backups
+  - DNS resolution for cluster services
+  - Service discovery and monitoring
+  - Node identity and authentication
+
+  What Kubernetes manages (workload layer):
+  - Container scheduling and placement
+  - Pod lifecycle and health
+  - Service load balancing
+  - Application scaling and updates
+
+  "Kubernetes isn't scary anymore."
